@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -13,6 +14,7 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/moby/hyperkit/go"
+	"github.com/moby/vpnkit/go/pkg/vpnkit"
 	"github.com/satori/go.uuid"
 )
 
@@ -43,7 +45,10 @@ func runHyperKit(args []string) {
 	ipStr := flags.String("ip", "", "IP address for the VM")
 	state := flags.String("state", "", "Path to directory to keep VM state in")
 	vsockports := flags.String("vsock-ports", "", "List of vsock ports to forward from the guest on startup (comma separated). A unix domain socket for each port will be created in the state directory")
-	networking := flags.String("networking", networkingDockerForMac, "Networking mode. Valid options are 'docker-for-mac', 'vpnkit[,socket-path]', 'vmnet' and 'none'. 'docker-for-mac' connects to the network used by Docker for Mac. 'vpnkit' connects to the VPNKit socket specified. If socket-path is omitted a new VPNKit instance will be started and 'vpnkit_eth.sock' will be created in the state directory. 'vmnet' uses the Apple vmnet framework, requires root/sudo. 'none' disables networking.`")
+	networking := flags.String("networking", networkingDockerForMac, "Networking mode. Valid options are 'docker-for-mac', 'vpnkit[,socket-path,control-path]', 'vmnet' and 'none'. 'docker-for-mac' connects to the network used by Docker for Mac. 'vpnkit' connects to the VPNKit socket specified. If socket-path is omitted a new VPNKit instance will be started and 'vpnkit_eth.sock' will be created in the state directory. 'vmnet' uses the Apple vmnet framework, requires root/sudo. 'none' disables networking.`")
+
+	publishFlags := multipleFlag{}
+	flags.Var(&publishFlags, "publish", "Publish a vm's port(s) to the host (default [])")
 
 	if err := flags.Parse(args); err != nil {
 		log.Fatal("Unable to parse args")
@@ -135,14 +140,23 @@ func runHyperKit(args []string) {
 	switch netMode[0] {
 	case networkingDockerForMac:
 		h.VPNKitSock = filepath.Join(os.Getenv("HOME"), "Library/Containers/com.docker.docker/Data/s50")
+		vpnKitPortSocket := filepath.Join(os.Getenv("HOME"), "Library/Containers/com.docker.docker/Data/s51")
+		cancelForwards, err := setupVPNKitForwards(vpnKitPortSocket, publishFlags)
+		if err != nil {
+			log.Fatalf("Failed to setup port forwards: %v", err)
+		}
+		defer cancelForwards()
 	case networkingVPNKit:
-		if len(netMode) > 1 {
-			// Socket path specified, try to use existing VPNKit instance
+		var vpnKitPortSocket string
+		switch len(netMode) {
+		case 2:
+			// Socket paths specified, try to use existing VPNKit instance
 			h.VPNKitSock = netMode[1]
-		} else {
+			vpnKitPortSocket = netMode[2]
+		case 0:
 			// Start new VPNKit instance
 			h.VPNKitSock = filepath.Join(*state, "vpnkit_eth.sock")
-			vpnKitPortSocket := filepath.Join(*state, "vpnkit_port.sock")
+			vpnKitPortSocket = filepath.Join(*state, "vpnkit_port.sock")
 			vsockSocket := filepath.Join(*state, "connect")
 			vpnKitProcess, err = launchVPNKit(h.VPNKitSock, vsockSocket, vpnKitPortSocket)
 			if err != nil {
@@ -160,11 +174,26 @@ func runHyperKit(args []string) {
 			h.Sockets9P = []hyperkit.Socket9P{{Path: vpnKitPortSocket, Tag: "port"}}
 			// VSOCK port 62373 is used to pass traffic from host->guest
 			h.VSockPorts = append(h.VSockPorts, 62373)
+		default:
+			log.Fatalf("Unable to parse %q options", networkingVPNKit)
 		}
+		cancelForwards, err := setupVPNKitForwards(vpnKitPortSocket, publishFlags)
+		if err != nil {
+			log.Fatalf("Failed to setup port forwards: %v", err)
+		}
+		defer cancelForwards()
 	case networkingVMNet:
+		if len(publishFlags) > 0 {
+			log.Fatalf("Host port publishing only available with %q or %q netmode",
+				networkingDockerForMac, networkingVPNKit)
+		}
 		h.VPNKitSock = ""
 		h.VMNet = true
 	case networkingNone:
+		if len(publishFlags) > 0 {
+			log.Fatalf("Host port publishing only available with %q or %q netmode",
+				networkingDockerForMac, networkingVPNKit)
+		}
 		h.VPNKitSock = ""
 	default:
 		log.Fatalf("Invalid networking mode: %s", netMode[0])
@@ -241,4 +270,43 @@ func launchVPNKit(etherSock string, vsockSock string, portSock string) (*os.Proc
 	go cmd.Wait() // run in background
 
 	return cmd.Process, nil
+}
+
+func setupVPNKitForwards(sock string, publishFlags multipleFlag) (func(), error) {
+	if len(publishFlags) == 0 {
+		return func() {}, nil
+	}
+
+	ctx := context.Background()
+
+	localhost := net.IPv4(127, 0, 0, 1)
+	guestIP := FOO() // XXX How to get?
+
+	c, err := vpnkit.NewConnection(ctx, sock)
+	if err != nil {
+		return func() {}, err
+	}
+
+	var ports []*vpnkit.Port
+	cancelForwards := func() {
+		for _, p := range ports {
+			p.Unexpose(ctx)
+		}
+	}
+
+	for _, publish := range publishFlags {
+		p, err := splitPublish(publish)
+		if err != nil {
+			return func() {}, err
+		}
+
+		port := vpnkit.NewPort(c, p.protocol, localhost, int16(p.host), guestIP, int16(p.guest))
+		if err = port.Expose(ctx); err != nil {
+			cancelForwards()
+			return func() {}, err
+		}
+		ports = append(ports, port)
+	}
+
+	return cancelForwards, nil
 }
