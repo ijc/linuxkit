@@ -21,6 +21,8 @@ services:
     image: linuxkit/getty:7abaf7b276c59f80891d92e9279e3e3ee8e2f512
     env:
      - INSECURE=true
+    user-binds:
+      - /content:/content:rshared,rbind
   - name: rngd
     image: linuxkit/rngd:45ed7759dd927f4cce3863073ea2e0da1d52a427
   - name: nginx
@@ -31,6 +33,17 @@ services:
      - CAP_SETUID
      - CAP_SETGID
      - CAP_DAC_OVERRIDE
+    binds:
+      - /content:/usr/share/nginx/html
+    runtime:
+      mounts:
+        - destination: /content
+          type: overlay
+          source: overlay
+          options:
+            - lowerdir=/content
+            - upperdir=/tmp/nginx-overlay/upper
+            - workdir=/tmp/nginx-overlay/work
 files:
   - path: etc/containerd/config.toml
     contents: |
@@ -53,6 +66,32 @@ files:
       address = ":13337"
   - path: etc/linuxkit-config
     metadata: yaml
+  - path: content/index.html
+    mode: "0775"
+    contents: |
+      <!DOCTYPE html>
+      <html>
+      <head>
+      <title>Welcome to LinuxKit!</title>
+      <p>If you see this page, LinuxKit and the included nginx web server are successfully running.</p>
+
+      <p>See the <a href="https://github.com/linuxkit/linuxkit/">LinuxKit repository</a> for more information</p>
+      </body>
+      </html>
+  - path: content/50x.html
+    mode: "0775"
+    contents: |
+      <!DOCTYPE html>
+      <html>
+      <head>
+      <title>Error</title>
+      </head>
+      <body>
+      <h1>An error occurred.</h1>
+      <p>Sorry, the page you are looking for is currently unavailable.<br/>
+      Please try again later.</p>
+      </body>
+      </html>
 trust:
   org:
     - linuxkit
